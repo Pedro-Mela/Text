@@ -1,19 +1,27 @@
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import javax.swing.border.MatteBorder;
+import javax.swing.filechooser.FileSystemView;
 import javax.imageio.ImageIO;
 import java.awt.*;
 import java.awt.datatransfer.DataFlavor;
 import java.awt.datatransfer.Transferable;
 import java.awt.dnd.*;
+import java.awt.event.ActionEvent;
+import java.awt.event.InputEvent;
+import java.awt.event.KeyEvent;
+import java.awt.event.MouseWheelListener;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
+import java.util.function.Consumer;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.rendering.PDFRenderer;
 
@@ -29,6 +37,8 @@ public class WinXPNotepad extends JFrame {
     private final JComboBox<String> fontSelector;
     private final CardLayout contentCardLayout = new CardLayout();
     private final JPanel contentCards = new JPanel(contentCardLayout);
+    private BufferedImage currentMediaImage;
+    private double mediaZoom = 1.0;
 
     // Zmienne do przechowywania informacji o aktualnie otwartym pliku
     private File currentFile = null;
@@ -118,6 +128,15 @@ public class WinXPNotepad extends JFrame {
         JScrollPane mediaScrollPane = new JScrollPane(mediaLabel);
         mediaScrollPane.setBorder(BorderFactory.createLineBorder(BORDER_COLOR));
         mediaScrollPane.getViewport().setBackground(Color.WHITE);
+        MouseWheelListener mediaZoomListener = event -> {
+            if (event.isControlDown()) {
+                zoomMedia(event.getWheelRotation() < 0 ? 1.1 : 1 / 1.1);
+                event.consume();
+            }
+        };
+        mediaScrollPane.addMouseWheelListener(mediaZoomListener);
+        mediaScrollPane.getViewport().addMouseWheelListener(mediaZoomListener);
+        mediaLabel.addMouseWheelListener(mediaZoomListener);
         mediaPanel.add(mediaScrollPane, BorderLayout.CENTER);
 
         JPanel pdfNavigation = new JPanel(new FlowLayout(FlowLayout.CENTER, 8, 0));
@@ -158,6 +177,7 @@ public class WinXPNotepad extends JFrame {
         previousPageButton.addActionListener(e -> showPdfPage(currentPdfPage - 1));
         nextPageButton.addActionListener(e -> showPdfPage(currentPdfPage + 1));
         updatePdfNavigation();
+        installKeyboardShortcuts();
 
         setupDragAndDrop();
         addWindowListener(new java.awt.event.WindowAdapter() {
@@ -189,19 +209,387 @@ public class WinXPNotepad extends JFrame {
         return button;
     }
 
+    private void installKeyboardShortcuts() {
+        int control = InputEvent.CTRL_DOWN_MASK;
+        bindShortcut(KeyStroke.getKeyStroke(KeyEvent.VK_O, control), "open-file",
+                this::openFileWithExplorer);
+        bindShortcut(KeyStroke.getKeyStroke(KeyEvent.VK_S, control), "save-file", this::saveFile);
+        bindShortcut(KeyStroke.getKeyStroke(KeyEvent.VK_N, control), "new-file", this::clearText);
+        bindShortcut(KeyStroke.getKeyStroke(KeyEvent.VK_EQUALS, control | InputEvent.SHIFT_DOWN_MASK),
+                "increase-font", () -> changeFontSize(1));
+        bindShortcut(KeyStroke.getKeyStroke(KeyEvent.VK_PLUS, control), "increase-font-plus",
+                () -> changeFontSize(1));
+        bindShortcut(KeyStroke.getKeyStroke(KeyEvent.VK_ADD, control), "increase-font-numpad",
+                () -> changeFontSize(1));
+        bindShortcut(KeyStroke.getKeyStroke(KeyEvent.VK_MINUS, control), "decrease-font",
+                () -> changeFontSize(-1));
+        bindShortcut(KeyStroke.getKeyStroke(KeyEvent.VK_SUBTRACT, control), "decrease-font-numpad",
+                () -> changeFontSize(-1));
+        bindShortcut(KeyStroke.getKeyStroke(KeyEvent.VK_0, control), "reset-media-zoom", () -> {
+            mediaZoom = 1.0;
+            updateMediaImage();
+        });
+    }
+
+    private void bindShortcut(KeyStroke keyStroke, String actionName, Runnable action) {
+        Action shortcutAction = new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent event) {
+                action.run();
+            }
+        };
+        JComponent rootPane = getRootPane();
+        rootPane.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(keyStroke, actionName);
+        rootPane.getActionMap().put(actionName, shortcutAction);
+        textArea.getInputMap(JComponent.WHEN_FOCUSED).put(keyStroke, actionName);
+        textArea.getActionMap().put(actionName, shortcutAction);
+    }
+
     // 1. Opcja dodania pliku: przez Eksplorator Windows
     private void openFileWithExplorer() {
-        JFileChooser fileChooser = new JFileChooser();
-        fileChooser.setDialogTitle("Otwórz plik");
-        fileChooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter(
-                "Tekst, obrazy i PDF", "txt", "text", "log", "png", "jpg", "jpeg", "gif", "bmp",
-                "tif", "tiff", "pdf"));
-
-        int userSelection = fileChooser.showOpenDialog(this);
-        if (userSelection == JFileChooser.APPROVE_OPTION) {
-            File fileToOpen = fileChooser.getSelectedFile();
+        File fileToOpen = showWindows8FileDialog();
+        if (fileToOpen != null) {
             loadFileContent(fileToOpen);
         }
+    }
+
+    private File showWindows8FileDialog() {
+        JDialog dialog = new JDialog(this, "Otwórz plik", true);
+        dialog.setDefaultCloseOperation(JDialog.DISPOSE_ON_CLOSE);
+
+        FileSystemView fileSystemView = FileSystemView.getFileSystemView();
+        File[] initialRoots = File.listRoots();
+        File initialDirectory = initialRoots.length == 0 ? new File(System.getProperty("user.home")) :
+                Arrays.stream(initialRoots).filter(File::isDirectory).findFirst().orElse(initialRoots[0]);
+        File[] currentDirectory = {initialDirectory};
+        File[] selectedFile = {null};
+        List<File> backHistory = new ArrayList<>();
+        boolean[] showingDriveList = {true};
+        boolean[] refreshingSidebar = {false};
+
+        JPanel content = new JPanel(new BorderLayout(0, 10));
+        content.setBackground(BACKGROUND);
+        content.setBorder(new EmptyBorder(0, 16, 14, 16));
+
+        JPanel header = new JPanel(new BorderLayout());
+        header.setBackground(ACCENT);
+        JLabel title = new JLabel("  Otwórz plik");
+        title.setFont(new Font("Segoe UI Light", Font.PLAIN, 22));
+        title.setForeground(Color.WHITE);
+        title.setBorder(new EmptyBorder(14, 8, 14, 8));
+        header.add(title, BorderLayout.CENTER);
+
+        JPanel locationBar = new JPanel(new BorderLayout(8, 0));
+        locationBar.setBackground(BACKGROUND);
+        JButton backButton = createFlatButton("←", new Color(90, 110, 125));
+        backButton.setToolTipText("Wróć do poprzedniego folderu");
+        backButton.setEnabled(false);
+        JButton upButton = createFlatButton("↑", ACCENT);
+        upButton.setToolTipText("Przejdź do folderu nadrzędnego");
+        JTextField locationField = new JTextField();
+        locationField.setFont(UI_FONT);
+        locationField.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(BORDER_COLOR), new EmptyBorder(7, 9, 7, 9)));
+        JPanel navigationButtons = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+        navigationButtons.setBackground(BACKGROUND);
+        navigationButtons.add(backButton);
+        navigationButtons.add(upButton);
+        locationBar.add(navigationButtons, BorderLayout.WEST);
+        locationBar.add(locationField, BorderLayout.CENTER);
+
+        DefaultListModel<File> fileListModel = new DefaultListModel<>();
+        JList<File> fileList = new JList<>(fileListModel);
+        fileList.setFont(UI_FONT);
+        fileList.setBackground(Color.WHITE);
+        fileList.setForeground(TEXT_COLOR);
+        fileList.setSelectionBackground(new Color(204, 232, 255));
+        fileList.setSelectionForeground(TEXT_COLOR);
+        fileList.setFixedCellHeight(34);
+        fileList.setCellRenderer(new DefaultListCellRenderer() {
+            @Override
+            public Component getListCellRendererComponent(JList<?> list, Object value, int index,
+                                                          boolean isSelected, boolean cellHasFocus) {
+                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+                File file = (File) value;
+                setText(file.getName().isEmpty() ? file.getPath() : file.getName());
+                setIcon(fileSystemView.getSystemIcon(file));
+                setBorder(new EmptyBorder(0, 8, 0, 8));
+                return this;
+            }
+        });
+        JTextField fileNameField = new JTextField();
+        fileNameField.setFont(UI_FONT);
+        fileNameField.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(BORDER_COLOR), new EmptyBorder(7, 9, 7, 9)));
+        Runnable[] refreshSidebar = {() -> { }};
+
+        Runnable refreshFiles = () -> {
+            fileListModel.clear();
+            File[] files = currentDirectory[0].listFiles(file ->
+                    file.isDirectory() || isSupportedOpenFile(file));
+            if (files != null) {
+                Arrays.sort(files, Comparator.comparing(File::isFile)
+                        .thenComparing(File::getName, String.CASE_INSENSITIVE_ORDER));
+                for (File file : files) {
+                    fileListModel.addElement(file);
+                }
+            }
+            locationField.setText(currentDirectory[0].getAbsolutePath());
+            fileList.clearSelection();
+        };
+
+        Consumer<File> navigateToDirectory = target -> {
+            if (target == null || !target.isDirectory()) {
+                return;
+            }
+            if (!sameDirectory(currentDirectory[0], target)) {
+                backHistory.add(currentDirectory[0]);
+                currentDirectory[0] = target;
+            }
+            showingDriveList[0] = false;
+            fileNameField.setText("");
+            refreshFiles.run();
+            refreshSidebar[0].run();
+            backButton.setEnabled(!backHistory.isEmpty());
+        };
+
+        Runnable navigateToLocation = () -> {
+            File target = new File(locationField.getText().trim());
+            if (target.isDirectory()) {
+                navigateToDirectory.accept(target);
+            } else if (target.isFile()) {
+                selectedFile[0] = target;
+                dialog.dispose();
+            } else {
+                JOptionPane.showMessageDialog(dialog, "Nie znaleziono folderu:\n" + target,
+                        "Nieprawidłowa lokalizacja", JOptionPane.WARNING_MESSAGE);
+            }
+        };
+
+        backButton.addActionListener(e -> {
+            if (!backHistory.isEmpty()) {
+                currentDirectory[0] = backHistory.remove(backHistory.size() - 1);
+                showingDriveList[0] = false;
+                fileNameField.setText("");
+                refreshFiles.run();
+                refreshSidebar[0].run();
+                backButton.setEnabled(!backHistory.isEmpty());
+            }
+        });
+        upButton.addActionListener(e -> {
+            File parent = currentDirectory[0].getParentFile();
+            if (parent != null) {
+                navigateToDirectory.accept(parent);
+            }
+        });
+        locationField.addActionListener(e -> navigateToLocation.run());
+        fileList.addListSelectionListener(e -> {
+            if (!e.getValueIsAdjusting()) {
+                File selected = fileList.getSelectedValue();
+                if (selected != null && selected.isFile()) {
+                    fileNameField.setText(selected.getName());
+                }
+            }
+        });
+        fileList.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override
+            public void mouseClicked(java.awt.event.MouseEvent e) {
+                if (e.getClickCount() == 2) {
+                    File selected = fileList.getSelectedValue();
+                    if (selected != null && selected.isDirectory()) {
+                        navigateToDirectory.accept(selected);
+                    } else if (selected != null) {
+                        selectedFile[0] = selected;
+                        dialog.dispose();
+                    }
+                }
+            }
+        });
+
+        JButton openButton = createFlatButton("Otwórz", ACCENT);
+        JButton cancelButton = createFlatButton("Anuluj", new Color(90, 110, 125));
+        openButton.addActionListener(e -> {
+            String enteredName = fileNameField.getText().trim();
+            File candidate = enteredName.isEmpty() ? fileList.getSelectedValue() :
+                    new File(currentDirectory[0], enteredName);
+            if (candidate == null) {
+                return;
+            }
+            if (candidate.isDirectory()) {
+                navigateToDirectory.accept(candidate);
+            } else if (candidate.isFile() && isSupportedOpenFile(candidate)) {
+                selectedFile[0] = candidate;
+                dialog.dispose();
+            } else {
+                JOptionPane.showMessageDialog(dialog, "Wybierz obsługiwany plik tekstowy, obraz lub PDF.",
+                        "Nie można otworzyć pliku", JOptionPane.WARNING_MESSAGE);
+            }
+        });
+        cancelButton.addActionListener(e -> dialog.dispose());
+        fileNameField.addActionListener(e -> openButton.doClick());
+        dialog.getRootPane().getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
+                .put(KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "close-file-dialog");
+        dialog.getRootPane().getActionMap().put("close-file-dialog", new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent event) {
+                dialog.dispose();
+            }
+        });
+        dialog.getRootPane().setDefaultButton(openButton);
+
+        JPanel fileDetails = new JPanel(new BorderLayout(10, 0));
+        fileDetails.setBackground(BACKGROUND);
+        fileDetails.add(new JLabel("Nazwa pliku:"), BorderLayout.WEST);
+        fileDetails.add(fileNameField, BorderLayout.CENTER);
+        fileDetails.add(new JLabel("Tekst, obrazy i PDF"), BorderLayout.EAST);
+
+        JPanel dialogButtons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+        dialogButtons.setBackground(BACKGROUND);
+        dialogButtons.add(openButton);
+        dialogButtons.add(cancelButton);
+        JPanel bottomPanel = new JPanel(new BorderLayout(0, 10));
+        bottomPanel.setBackground(BACKGROUND);
+        bottomPanel.add(fileDetails, BorderLayout.CENTER);
+        bottomPanel.add(dialogButtons, BorderLayout.SOUTH);
+
+        JPanel browser = new JPanel(new BorderLayout(0, 8));
+        browser.setBackground(BACKGROUND);
+        browser.add(locationBar, BorderLayout.NORTH);
+        JScrollPane fileScrollPane = new JScrollPane(fileList);
+        fileScrollPane.setBorder(BorderFactory.createLineBorder(BORDER_COLOR));
+        fileScrollPane.getViewport().setBackground(Color.WHITE);
+
+        DefaultListModel<File> driveListModel = new DefaultListModel<>();
+        JList<File> driveList = new JList<>(driveListModel);
+        driveList.setFont(UI_FONT);
+        driveList.setBackground(Color.WHITE);
+        driveList.setSelectionBackground(new Color(204, 232, 255));
+        driveList.setFixedCellHeight(64);
+        driveList.setCellRenderer(new DefaultListCellRenderer() {
+            @Override
+            public Component getListCellRendererComponent(JList<?> list, Object value, int index,
+                                                          boolean isSelected, boolean cellHasFocus) {
+                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+                File location = (File) value;
+                setText("<html><div style='text-align:center'>" + fileSystemView.getSystemDisplayName(location)
+                        + "</div></html>");
+                setIcon(fileSystemView.getSystemIcon(location));
+                setHorizontalAlignment(SwingConstants.CENTER);
+                setVerticalAlignment(SwingConstants.CENTER);
+                setHorizontalTextPosition(SwingConstants.CENTER);
+                setVerticalTextPosition(SwingConstants.BOTTOM);
+                setBorder(new EmptyBorder(5, 3, 5, 3));
+                return this;
+            }
+        });
+        JPanel drivePanel = new JPanel(new BorderLayout(0, 6));
+        drivePanel.setBackground(BACKGROUND);
+        drivePanel.setBorder(new EmptyBorder(0, 0, 0, 8));
+        JLabel drivesHeading = new JLabel("DYSKI");
+        drivesHeading.setFont(new Font("Segoe UI", Font.BOLD, 12));
+        drivesHeading.setForeground(TOOLBAR_BACKGROUND);
+        drivesHeading.setBorder(new EmptyBorder(2, 4, 2, 4));
+        JButton showDrivesButton = createFlatButton("Dyski", ACCENT);
+        showDrivesButton.addActionListener(e -> {
+            showingDriveList[0] = true;
+            refreshSidebar[0].run();
+        });
+        JPanel sidebarHeader = new JPanel(new BorderLayout());
+        sidebarHeader.setBackground(BACKGROUND);
+        sidebarHeader.add(drivesHeading, BorderLayout.CENTER);
+        sidebarHeader.add(showDrivesButton, BorderLayout.EAST);
+        drivePanel.add(sidebarHeader, BorderLayout.NORTH);
+        JScrollPane driveScrollPane = new JScrollPane(driveList);
+        driveScrollPane.setPreferredSize(new Dimension(112, 0));
+        driveScrollPane.setBorder(BorderFactory.createLineBorder(BORDER_COLOR));
+        driveScrollPane.getViewport().setBackground(Color.WHITE);
+        drivePanel.add(driveScrollPane, BorderLayout.CENTER);
+
+        refreshSidebar[0] = () -> {
+            refreshingSidebar[0] = true;
+            driveListModel.clear();
+            if (showingDriveList[0]) {
+                drivesHeading.setText("DYSKI");
+                showDrivesButton.setVisible(false);
+                for (File root : File.listRoots()) {
+                    driveListModel.addElement(root);
+                }
+            } else {
+                drivesHeading.setText("SZYBKIE FOLDERY");
+                showDrivesButton.setVisible(true);
+                File driveRoot = findDriveRoot(currentDirectory[0]);
+                File userHome = new File(System.getProperty("user.home"));
+                if (driveRoot != null && sameDirectory(findDriveRoot(userHome), driveRoot)) {
+                    for (String folderName : List.of(
+                            "Desktop", "Documents", "Downloads", "Pictures", "Music", "Videos")) {
+                        File folder = new File(userHome, folderName);
+                        if (folder.isDirectory()) {
+                            driveListModel.addElement(folder);
+                        }
+                    }
+                }
+                if (driveListModel.isEmpty() && driveRoot != null) {
+                    File[] folders = driveRoot.listFiles(File::isDirectory);
+                    if (folders != null) {
+                        Arrays.sort(folders, Comparator.comparing(File::getName,
+                                String.CASE_INSENSITIVE_ORDER));
+                        for (File folder : folders) {
+                            driveListModel.addElement(folder);
+                        }
+                    }
+                }
+            }
+            refreshingSidebar[0] = false;
+        };
+        driveList.addListSelectionListener(e -> {
+            if (!e.getValueIsAdjusting() && !refreshingSidebar[0]) {
+                navigateToDirectory.accept(driveList.getSelectedValue());
+            }
+        });
+        refreshSidebar[0].run();
+
+        JPanel browserContent = new JPanel(new BorderLayout(10, 0));
+        browserContent.setBackground(BACKGROUND);
+        browserContent.add(drivePanel, BorderLayout.WEST);
+        browserContent.add(fileScrollPane, BorderLayout.CENTER);
+        browser.add(browserContent, BorderLayout.CENTER);
+        browser.add(bottomPanel, BorderLayout.SOUTH);
+
+        content.add(browser, BorderLayout.CENTER);
+        dialog.setContentPane(new JPanel(new BorderLayout()));
+        dialog.getContentPane().add(header, BorderLayout.NORTH);
+        dialog.getContentPane().add(content, BorderLayout.CENTER);
+        refreshFiles.run();
+        dialog.setSize(860, 560);
+        dialog.setMinimumSize(new Dimension(700, 440));
+        dialog.setLocationRelativeTo(this);
+        dialog.setVisible(true);
+        return selectedFile[0];
+    }
+
+    private boolean isSupportedOpenFile(File file) {
+        String name = file.getName().toLowerCase();
+        return name.endsWith(".txt") || name.endsWith(".text") || name.endsWith(".log")
+                || isImageFile(file) || name.endsWith(".pdf");
+    }
+
+    private static File findDriveRoot(File location) {
+        if (location == null) {
+            return null;
+        }
+        for (File root : File.listRoots()) {
+            if (location.toPath().toAbsolutePath().normalize()
+                    .startsWith(root.toPath().toAbsolutePath().normalize())) {
+                return root;
+            }
+        }
+        return null;
+    }
+
+    private static boolean sameDirectory(File first, File second) {
+        return first != null && second != null
+                && first.toPath().toAbsolutePath().normalize()
+                .equals(second.toPath().toAbsolutePath().normalize());
     }
 
     // Opcja zapisu pliku
@@ -235,6 +623,9 @@ public class WinXPNotepad extends JFrame {
     // Opcja czyszczenia tekstu
     private void clearText() {
         closeCurrentPdf();
+        currentMediaImage = null;
+        mediaZoom = 1.0;
+        mediaLabel.setIcon(null);
         textArea.setText("");
         currentFile = null; // Zapominamy o starym pliku, żeby przy zapisie spytać o nową ścieżkę
         currentCharset = StandardCharsets.UTF_8;
@@ -312,6 +703,28 @@ public class WinXPNotepad extends JFrame {
         textArea.setFont(new Font(currentFontFamily, Font.PLAIN, currentFontSize));
     }
 
+    private void zoomMedia(double factor) {
+        if (currentMediaImage == null) {
+            return;
+        }
+        mediaZoom = Math.max(0.1, Math.min(5.0, mediaZoom * factor));
+        updateMediaImage();
+        statusLabel.setText(" Powiększenie obrazu: " + Math.round(mediaZoom * 100) + "% (Ctrl+0: reset)");
+    }
+
+    private void updateMediaImage() {
+        if (currentMediaImage == null) {
+            return;
+        }
+        int width = Math.max(1, (int) Math.round(currentMediaImage.getWidth() * mediaZoom));
+        int height = Math.max(1, (int) Math.round(currentMediaImage.getHeight() * mediaZoom));
+        Image displayImage = mediaZoom == 1.0 ? currentMediaImage :
+                currentMediaImage.getScaledInstance(width, height, Image.SCALE_SMOOTH);
+        mediaLabel.setIcon(new ImageIcon(displayImage));
+        mediaLabel.revalidate();
+        mediaLabel.repaint();
+    }
+
     private void changeFontSize(int change) {
         currentFontSize = Math.max(8, Math.min(72, currentFontSize + change));
         updateTextFont();
@@ -335,7 +748,9 @@ public class WinXPNotepad extends JFrame {
                 throw new IOException("Nieobsługiwany lub uszkodzony plik obrazu.");
             }
             closeCurrentPdf();
-            mediaLabel.setIcon(new ImageIcon(image));
+            currentMediaImage = image;
+            mediaZoom = 1.0;
+            updateMediaImage();
             pdfPageLabel.setText("Obraz: " + image.getWidth() + " × " + image.getHeight());
             saveButton.setEnabled(false);
             fontSelector.setEnabled(false);
@@ -360,6 +775,7 @@ public class WinXPNotepad extends JFrame {
             closeCurrentPdf();
             currentPdf = document;
             currentPdfPage = 0;
+            mediaZoom = 1.0;
             saveButton.setEnabled(false);
             fontSelector.setEnabled(false);
             mediaLabel.setIcon(null);
@@ -381,7 +797,8 @@ public class WinXPNotepad extends JFrame {
         try {
             BufferedImage pageImage = new PDFRenderer(currentPdf).renderImageWithDPI(pageIndex, 110);
             currentPdfPage = pageIndex;
-            mediaLabel.setIcon(new ImageIcon(pageImage));
+            currentMediaImage = pageImage;
+            updateMediaImage();
             pdfPageLabel.setText("Strona " + (pageIndex + 1) + " z " + currentPdf.getNumberOfPages());
             updatePdfNavigation();
             statusLabel.setText(" Wyświetlono stronę " + (pageIndex + 1) + " z " + currentFile.getName());
